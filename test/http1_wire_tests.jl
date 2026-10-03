@@ -653,3 +653,50 @@ end
     @test parsed.method == "CONNECT"
     @test parsed.host == "origin.example:443"
 end
+
+@testset "HTTP/1 header intake normalization (parse fast paths)" begin
+    # OWS around received values is trimmed; names are canonicalized from any
+    # case; bare CR inside a value is rewritten to SP (obs-fold hygiene).
+    raw = "GET / HTTP/1.1\r\n" *
+          "host: example.com\r\n" *
+          "x-pad:\tvalue-with-tab-and-sp \t\r\n" *
+          "X-CR-Value: a\rb\r\n" *
+          "X-Utf8: caf\xc3\xa9\r\n" *
+          "x-empty:\r\n" *
+          "X-All-Ows:   \r\n" *
+          "\r\n"
+    req = HT.read_request(IOBuffer(codeunits(raw)))
+    @test HT.header(req.headers, "Host") == "example.com"
+    @test HT.header(req.headers, "X-Pad") == "value-with-tab-and-sp"
+    @test HT.header(req.headers, "X-Cr-Value") == "a b"
+    @test HT.header(req.headers, "X-Utf8") == "café"
+    @test HT.header(req.headers, "X-Empty") == ""
+    @test HT.header(req.headers, "X-All-Ows") == ""
+    # Stored keys are canonical regardless of wire case.
+    stored_keys = [first(e) for e in req.headers.entries]
+    @test stored_keys == ["Host", "X-Pad", "X-Cr-Value", "X-Utf8", "X-Empty", "X-All-Ows"]
+
+    # A lone Content-Length with surrounding OWS is canonicalized to its
+    # trimmed spelling, exactly as duplicate-equal values collapse.
+    padded_cl = "POST /u HTTP/1.1\r\nHost: x\r\ncontent-length:  5 \r\n\r\nhello"
+    cl_req = HT.read_request(IOBuffer(codeunits(padded_cl)))
+    @test cl_req.content_length == 5
+    @test HT.headers(cl_req.headers, "Content-Length") == ["5"]
+    @test _read_all_body_bytes(cl_req.body) == collect(codeunits("hello"))
+
+    # Version spellings outside the fixed "HTTP/d.d" fast path still parse.
+    for (wire, want) in (("HTTP/10.11", (0x0a, 0x0b)), ("HTTP/1.1", (0x01, 0x01)))
+        got = HT._parse_http_version(wire)
+        @test got == want
+    end
+    @test_throws HT.ParseError HT._parse_http_version("HTTP/1.1.1")
+    @test_throws HT.ParseError HT._parse_http_version("HTTP/x.1")
+
+    # canonical_header_key keeps its contract for both cached and uncached
+    # names and for already-canonical input (which returns the same string).
+    @test HT.canonical_header_key("content-type") == "Content-Type"
+    @test HT.canonical_header_key("x-b3-traceid") == "X-B3-Traceid"
+    @test HT.canonical_header_key("X-B3-Traceid") == "X-B3-Traceid"
+    same = "Content-Type"
+    @test HT.canonical_header_key(same) === same
+end

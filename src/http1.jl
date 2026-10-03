@@ -183,17 +183,41 @@ function _read_headers(io::IO, max_line_bytes::Integer, max_header_bytes::Intege
         isempty(line) && return _fold_received_fields!(headers, _h1_separate_field)
         sep = findfirst(':', line)
         sep === nothing && throw(ParseError("malformed HTTP/1 header line (missing ':'): $(repr(line))"))
-        key = String(SubString(line, firstindex(line), prevind(line, sep)))
-        key == _trim_http_ows(key) || throw(ParseError("malformed HTTP/1 header line (whitespace before ':'): $(repr(line))"))
+        # Keep key and value as SubStrings borrowed from the line and let the
+        # validators/canonicalizer work on their bytes. The previous version
+        # materialized the key, an OWS-trimmed copy of it just to compare, and
+        # two value copies per header line; the common case is now one String
+        # per line (from `_readline_crlf`) plus one for the stored value.
+        key = SubString(line, firstindex(line), prevind(line, sep))
+        if !isempty(key)
+            # OWS around the field name is forbidden (RFC 9112 §5.1); checking
+            # the edge bytes directly replaces a compare against an allocated
+            # trimmed copy.
+            b_lo = codeunit(key, 1)
+            b_hi = codeunit(key, ncodeunits(key))
+            (b_lo == 0x20 || b_lo == 0x09 || b_hi == 0x20 || b_hi == 0x09) &&
+                throw(ParseError("malformed HTTP/1 header line (whitespace before ':'): $(repr(line))"))
+        end
         _valid_header_field_name(key) || throw(ParseError("invalid HTTP/1 header field name: $(repr(key))"))
-        value = _trim_http_ows(SubString(line, nextind(line, sep), lastindex(line)))
-        normalized = _normalize_header_field_value(value)
+        normalized = _normalize_header_field_value(SubString(line, nextind(line, sep), lastindex(line)))
         normalized === nothing && throw(ParseError("invalid HTTP/1 header field value for $(repr(key))"))
         push!(headers, canonical_header_key(key) => normalized)
     end
 end
 
 function _parse_http_version(version::AbstractString)::Tuple{UInt8,UInt8}
+    # Fast path: "HTTP/<d>.<d>" covers every version on the wire today. Parse
+    # it directly from the borrowed bytes; the general path below keeps the
+    # historical behavior (and error messages) for other spellings such as
+    # "HTTP/2" or "HTTP/10.1".
+    if (version isa String || version isa SubString{String}) && ncodeunits(version) == 8
+        u = codeunits(version)
+        @inbounds if u[1] == 0x48 && u[2] == 0x54 && u[3] == 0x54 && u[4] == 0x50 &&
+                    u[5] == 0x2f && u[7] == 0x2e &&
+                    0x30 <= u[6] <= 0x39 && 0x30 <= u[8] <= 0x39
+            return UInt8(u[6] - 0x30), UInt8(u[8] - 0x30)
+        end
+    end
     startswith(version, "HTTP/") || throw(ParseError("invalid HTTP version token: $(repr(version))"))
     parts = split(String(SubString(version, 6)), '.'; limit=2)
     length(parts) == 2 || throw(ParseError("invalid HTTP version token: $(repr(version))"))
@@ -213,11 +237,22 @@ function _parse_http_version(version::AbstractString)::Tuple{UInt8,UInt8}
 end
 
 function _parse_int64_decimal_header_value(value::AbstractString, kind::AbstractString)::Int64
-    trimmed = _trim_http_ows(value)
-    isempty(trimmed) && throw(ParseError("empty $kind header value"))
+    # Trim OWS by byte bounds and parse in place; the previous version built a
+    # trimmed String copy of every value on the request path.
+    n = ncodeunits(value)
+    lo = 1
+    hi = n
+    while lo <= hi && (codeunit(value, lo) == 0x20 || codeunit(value, lo) == 0x09)
+        lo += 1
+    end
+    while hi >= lo && (codeunit(value, hi) == 0x20 || codeunit(value, hi) == 0x09)
+        hi -= 1
+    end
+    hi < lo && throw(ParseError("empty $kind header value"))
     limit = UInt64(typemax(Int64))
     total = UInt64(0)
-    @inbounds for b in codeunits(trimmed)
+    @inbounds for i in lo:hi
+        b = codeunit(value, i)
         0x30 <= b <= 0x39 || throw(ParseError("invalid $kind header value: $(repr(value))"))
         digit = UInt64(b - 0x30)
         total > ((limit - digit) ÷ UInt64(10)) && throw(ParseError("invalid $kind header value: $(repr(value))"))
@@ -227,21 +262,31 @@ function _parse_int64_decimal_header_value(value::AbstractString, kind::Abstract
 end
 
 function _parse_content_length(hdrs::Headers)::Int64
-    values = headers(hdrs, "Content-Length")
-    isempty(values) && return Int64(-1)
+    # One allocation-free scan of the entry vector replaces `headers()` (which
+    # materializes a Vector{String} on every request): find every value,
+    # require them all to agree, and canonicalize whitespace around a lone
+    # value exactly as before.
+    entries = hdrs.entries
     parsed = Int64(-1)
     canonical = ""
-    for value in values
-        trimmed = _trim_http_ows(value)
+    count = 0
+    first_value = ""
+    @inbounds for i in eachindex(entries)
+        entry = entries[i]
+        _ascii_equal_fold(first(entry), "Content-Length") || continue
+        value = last(entry)
+        count += 1
+        count == 1 && (first_value = value)
         n = _parse_int64_decimal_header_value(value, "Content-Length")
         if parsed == Int64(-1)
             parsed = n
-            canonical = trimmed
-            continue
+            canonical = _ows_trimmed(value)
+        else
+            n == parsed || throw(ProtocolError("mismatched Content-Length header values"))
         end
-        parsed == n || throw(ProtocolError("mismatched Content-Length header values"))
     end
-    length(values) == 1 && values[1] == canonical || begin
+    count == 0 && return Int64(-1)
+    (count == 1 && first_value == canonical) || begin
         removeheader(hdrs, "Content-Length")
         setheader(hdrs, "Content-Length", canonical)
     end
@@ -249,8 +294,8 @@ function _parse_content_length(hdrs::Headers)::Int64
 end
 
 function _parse_transfer_encoding!(hdrs::Headers, proto_major::UInt8, proto_minor::UInt8)::Bool
-    values = headers(hdrs, "Transfer-Encoding")
-    isempty(values) && return false
+    first_value = _first_header_value(hdrs, "Transfer-Encoding")
+    first_value === nothing && return false
     if proto_major < UInt8(1) || (proto_major == UInt8(1) && proto_minor < UInt8(1))
         # RFC 9112 §6.1: an HTTP/1.0 message must not use Transfer-Encoding; a
         # recipient that receives one has faulty framing. The old behavior
@@ -263,8 +308,8 @@ function _parse_transfer_encoding!(hdrs::Headers, proto_major::UInt8, proto_mino
         # bytes remain on the transport.
         throw(ProtocolError("Transfer-Encoding is not allowed in HTTP/1.0 messages"))
     end
-    length(values) == 1 || throw(ProtocolError("too many Transfer-Encoding header values"))
-    raw = _trim_http_ows(values[1])
+    _count_header_values(hdrs, "Transfer-Encoding") == 1 || throw(ProtocolError("too many Transfer-Encoding header values"))
+    raw = _ows_trimmed(first_value)
     _ascii_equal_fold(raw, "chunked") || throw(ProtocolError("unsupported transfer encoding"))
     setheader(hdrs, "Transfer-Encoding", "chunked")
     return true
@@ -315,15 +360,14 @@ function _validate_request_start_line!(method::String, target::String, host::Uni
 end
 
 function _validate_request_host!(hdrs::Headers, method::String, proto_major::UInt8, proto_minor::UInt8)::Union{Nothing,String}
-    host_values = headers(hdrs, "Host")
+    host = _first_header_value(hdrs, "Host")
     if (proto_major > UInt8(1) || (proto_major == UInt8(1) && proto_minor >= UInt8(1))) &&
-       isempty(host_values) &&
+       host === nothing &&
        method != "CONNECT"
         throw(ProtocolError("missing required Host header"))
     end
-    length(host_values) > 1 && throw(ProtocolError("too many Host headers"))
-    isempty(host_values) && return nothing
-    host = host_values[1]
+    _count_header_values(hdrs, "Host") > 1 && throw(ProtocolError("too many Host headers"))
+    host === nothing && return nothing
     _valid_host_header(host) || throw(ProtocolError("malformed Host header"))
     return host
 end
@@ -934,13 +978,15 @@ function write_response!(io::IO, response::Response)
 end
 
 function _parse_request_line(line::AbstractString)::Tuple{String,String,UInt8,UInt8}
-    first_space = findfirst(isequal(' '), line)
+    first_space = findfirst(' ', line)
     first_space === nothing && throw(ParseError("malformed HTTP/1 request line: $(repr(line))"))
-    second_space = findnext(isequal(' '), line, nextind(line, first_space))
+    second_space = findnext(' ', line, nextind(line, first_space))
     second_space === nothing && throw(ParseError("malformed HTTP/1 request line: $(repr(line))"))
     method = String(SubString(line, firstindex(line), prevind(line, first_space)))
     target = String(SubString(line, nextind(line, first_space), prevind(line, second_space)))
-    version = String(SubString(line, nextind(line, second_space), lastindex(line)))
+    # The version token is only consumed by `_parse_http_version`, whose fast
+    # path reads the borrowed bytes — no String materialization needed.
+    version = SubString(line, nextind(line, second_space), lastindex(line))
     isempty(method) && throw(ParseError("empty HTTP method in request line"))
     isempty(target) && throw(ParseError("empty HTTP target in request line"))
     _valid_header_field_name(method) || throw(ParseError("invalid HTTP method in request line: $(repr(method))"))

@@ -450,9 +450,9 @@ end
 end
 
 function _valid_header_field_name(name::AbstractString)::Bool
-    raw = name isa String ? (name::String) : String(name)
-    isempty(raw) && return false
-    @inbounds for b in codeunits(raw)
+    isempty(name) && return false
+    @inbounds for i in 1:ncodeunits(name)
+        b = codeunit(name, i)
         (0x30 <= b <= 0x39 || 0x41 <= b <= 0x5a || 0x61 <= b <= 0x7a ||
          b == 0x21 || b == 0x23 || b == 0x24 || b == 0x25 || b == 0x26 || b == 0x27 ||
          b == 0x2a || b == 0x2b || b == 0x2d || b == 0x2e || b == 0x5e || b == 0x5f ||
@@ -462,6 +462,62 @@ function _valid_header_field_name(name::AbstractString)::Bool
 end
 
 function _normalize_header_field_value(value::AbstractString)::Union{Nothing,String}
+    if value isa String || value isa SubString{String}
+        # Fast path for the common wire shape: valid field-value bytes with no
+        # CR/LF and no surrounding OWS. Scan the borrowed bytes directly and
+        # materialize at most one String — zero when `value` is an already
+        # normalized String (the usual case for outgoing user headers). The
+        # previous implementation copied SubString→String up front and then
+        # `_trim_http_ows` copied again even when there was nothing to trim.
+        n = ncodeunits(value)
+        lo = 1
+        hi = n
+        while lo <= hi && (codeunit(value, lo) == 0x20 || codeunit(value, lo) == 0x09)
+            lo += 1
+        end
+        while hi >= lo && (codeunit(value, hi) == 0x20 || codeunit(value, hi) == 0x09)
+            hi -= 1
+        end
+        if hi >= lo
+            needs_rewrite = false
+            ascii_only = true
+            @inbounds for i in lo:hi
+                b = codeunit(value, i)
+                if b == 0x0d || b == 0x0a
+                    needs_rewrite = true
+                elseif (b < 0x20 || b == 0x7f) && b != 0x09
+                    return nothing
+                elseif b >= 0x80
+                    ascii_only = false
+                end
+            end
+            if !needs_rewrite && lo == 1 && hi == n
+                return value isa String ? (value::String) : String(value)
+            end
+            if ascii_only
+                if !needs_rewrite
+                    # Byte indices are character indices for ASCII, so the
+                    # trimmed view materializes as a single copy.
+                    return String(SubString(value, lo, hi))
+                end
+                # CR/LF become SP (obs-fold hygiene); re-trim afterwards in
+                # case a rewritten edge byte was OWS.
+                buf = Vector{UInt8}(undef, hi - lo + 1)
+                j = 0
+                @inbounds for i in lo:hi
+                    b = codeunit(value, i)
+                    buf[j += 1] = (b == 0x0d || b == 0x0a) ? 0x20 : b
+                end
+                blo, bhi = _trim_http_ows_bounds(buf)
+                blo > bhi && return ""
+                return blo == 1 && bhi == length(buf) ? String(buf) : String(buf[blo:bhi])
+            end
+        else
+            return ""
+        end
+    end
+    # Fallback for non-ASCII content and exotic AbstractString types: keep
+    # the historical behavior (copy first, then trim by character indices).
     raw = value isa String ? (value::String) : String(value)
     bytes = codeunits(raw)
     needs_rewrite = false
@@ -560,6 +616,9 @@ function _valid_host_header(host::AbstractString)::Bool
     return true
 end
 
+# Common canonical header names, mapped to themselves. Invariant relied on by
+# `canonical_header_key`: values are never empty, so `get(cache, key, "")`
+# can use the empty string as a cache-miss sentinel without allocating.
 const _COMMON_CANONICAL_HEADER_KEYS = Dict(
     "Accept" => "Accept",
     "Accept-Charset" => "Accept-Charset",
@@ -599,40 +658,56 @@ protocol validation where needed.
 """
 function canonical_header_key(key::AbstractString)::String
     isempty(key) && return ""
-    key_s = String(key)
-    upper_next = true
-    canonical = true
-    @inbounds for b in codeunits(key_s)
-        if upper_next
-            if 0x61 <= b <= 0x7a
-                canonical = false
-                break
+    if key isa String || key isa SubString{String}
+        upper_next = true
+        canonical = true
+        @inbounds for b in codeunits(key)
+            if upper_next
+                if 0x61 <= b <= 0x7a
+                    canonical = false
+                    break
+                end
+            else
+                if 0x41 <= b <= 0x5a
+                    canonical = false
+                    break
+                end
             end
-        else
-            if 0x41 <= b <= 0x5a
-                canonical = false
-                break
+            upper_next = (b == 0x2d)
+        end
+        if canonical
+            # Cache hits (every common header name on the wire) must not pay
+            # for a materialized copy of `key`, which is usually a SubString
+            # borrowed from the line buffer. `get` hashes the borrowed content
+            # without converting the key; the empty-string default doubles as
+            # the miss sentinel because the cache never stores an empty value.
+            cached = get(_COMMON_CANONICAL_HEADER_KEYS, key, "")
+            isempty(cached) || return cached
+            return key isa String ? (key::String) : String(key)
+        end
+        # Not canonical: recase per dash-segment into a byte buffer. The old
+        # path built a `Vector{Char}` (4 bytes per character) before copying
+        # into the result `String`; this writes the UTF-8 bytes directly, so
+        # non-ASCII bytes pass through unchanged either way.
+        src = codeunits(key)
+        buf = Vector{UInt8}(undef, length(src))
+        i = 0
+        upper_next = true
+        @inbounds for b in src
+            i += 1
+            if upper_next && 0x61 <= b <= 0x7a
+                b -= 0x20
+            elseif !upper_next && 0x41 <= b <= 0x5a
+                b += 0x20
             end
+            buf[i] = b
+            upper_next = (b == 0x2d)
         end
-        upper_next = (b == 0x2d)
+        canon = String(buf)
+        cached = get(_COMMON_CANONICAL_HEADER_KEYS, canon, "")
+        return isempty(cached) ? canon : cached
     end
-    if canonical
-        return get(() -> key_s, _COMMON_CANONICAL_HEADER_KEYS, key_s)
-    end
-    chars = Vector{Char}(undef, ncodeunits(key_s))
-    upper_next = true
-    i = 1
-    for c in key_s
-        if upper_next
-            chars[i] = _to_ascii_upper(c)
-        else
-            chars[i] = _to_ascii_lower(c)
-        end
-        upper_next = chars[i] == '-'
-        i += 1
-    end
-    canon = String(chars[1:(i-1)])
-    return get(() -> canon, _COMMON_CANONICAL_HEADER_KEYS, canon)
+    return canonical_header_key(String(key))
 end
 
 """
@@ -840,6 +915,29 @@ function headers(headers::Headers, key::AbstractString)::Vector{String}
         _ascii_equal_fold(name, key) && push!(out, value)
     end
     return out
+end
+
+# Allocation-free lookups for parser hot paths. The public `headers(hdrs, key)`
+# materializes a `Vector{String}` on every call; parsing one message consults
+# the framing headers (Content-Length / Transfer-Encoding / Host) several
+# times, so these scan the entry vector in place instead.
+@inline function _first_header_value(hdrs::Headers, key::AbstractString)::Union{Nothing,String}
+    entries = hdrs.entries
+    @inbounds for i in eachindex(entries)
+        entry = entries[i]
+        _ascii_equal_fold(first(entry), key) && return last(entry)
+    end
+    return nothing
+end
+
+@inline function _count_header_values(hdrs::Headers, key::AbstractString)::Int
+    entries = hdrs.entries
+    count = 0
+    @inbounds for i in eachindex(entries)
+        entry = entries[i]
+        _ascii_equal_fold(first(entry), key) && (count += 1)
+    end
+    return count
 end
 
 """Return `true` when the first value for `key` is non-empty."""
@@ -1134,6 +1232,18 @@ end
     end
     hi < lo && return ""
     return String(SubString(s, lo, hi))
+end
+
+# Trim surrounding OWS from an already-owned String without copying when the
+# value is already clean (header values in `Headers` are normally stored
+# trimmed, so the copy is the rare path).
+@inline function _ows_trimmed(v::String)::String
+    n = ncodeunits(v)
+    n == 0 && return v
+    b_lo = codeunit(v, 1)
+    b_hi = codeunit(v, n)
+    (b_lo == 0x20 || b_lo == 0x09 || b_hi == 0x20 || b_hi == 0x09) || return v
+    return _trim_http_ows(v)
 end
 
 @inline function _trim_http_ows_bounds(bytes)::Tuple{Int,Int}
